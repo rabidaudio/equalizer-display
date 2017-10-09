@@ -3,9 +3,38 @@
 
 #define BANDS 7
 #define LP_STEPS 16
-#define BUCKETS 256
 
 #define DEBUG 0
+
+// 32x16 display setup
+#include <Adafruit_GFX.h>   // Core graphics library
+#include <RGBmatrixPanel.h> // Hardware-specific library
+
+#define CLK 10
+#define LAT A3
+#define OE  9
+#define A   A0
+#define B   A1
+#define C   A2
+
+#define WIDTH 32
+#define HEIGHT 16
+
+#define HUE_ROLL 1536
+
+// Last parameter = 'true' enables double-buffering, for flicker-free,
+// buttery smooth animation.  Note that NOTHING WILL SHOW ON THE DISPLAY
+// until the first call to swapBuffers().  This is normal.
+RGBmatrixPanel matrix(A, B, C, CLK, LAT, OE, true);
+
+// each band gets 4 pixels, except the two which get 6
+// this could be calculated with conditionals, but memory is readily available on the mega so
+// we unroll for performance
+const int bandOffsets[] = {0, 6, 10, 14, 18, 22, 26};
+const int bandWidths[] =  {6, 4,  4,  4,  4,  4,  6};
+
+uint16_t hue = 0;
+uint16_t color, colorInverse;
 
 uint8_t measureIndex = 0;
 uint8_t passIndex = 0;
@@ -17,21 +46,32 @@ uint16_t measurements[BANDS * LP_STEPS];
 // we can start taking measurements.
 uint8_t resetState = 3;
 
+boolean playing = false;
+boolean connected = false;
+
+String title, artist, track;
+int textX, textMin;
+boolean trackShown;
+
 void setup() {
   // put your setup code here, to run once:
 
   pinMode(STROBE, OUTPUT);
   pinMode(RESET, OUTPUT);
 
-  for (uint8_t i = 0; i < BANDS; i++) {
-    pinMode(i + 2, OUTPUT);
-  }
-
   if(DEBUG) Serial.begin(9600);
 
   setupBluetooth();
 
   setupTimer();
+
+  matrix.begin();
+  matrix.setTextWrap(false); // Allow text to run off right edge
+  matrix.setTextSize(1);
+
+  // clear screen, just in case
+  matrix.fillScreen(0);
+  matrix.swapBuffers(false);
 }
 
 ISR(TIMER5_COMPA_vect){
@@ -52,7 +92,7 @@ ISR(TIMER5_COMPB_vect) {
   // if resetState is 0 and strobe is low
   if (!resetState && !(PORTB & (1 << 6))) {
     // take measurement
-    measurements[(passIndex * BANDS) + measureIndex] = analogRead(A0);
+    measurements[(passIndex * BANDS) + measureIndex] = analogRead(A7);
     // increment measureIndex
     measureIndex = (measureIndex + 1) % BANDS;
     if (!measureIndex) {
@@ -61,30 +101,22 @@ ISR(TIMER5_COMPB_vect) {
   }
 }
 
-String title = "";
-String artist = "";
-boolean playing = false;
-boolean connected = false;
-boolean hasShownTitle = false;
-
 void loop() {
-  // put your main code here, to run repeatedly:
-//  Serial.print("Values: ");
-//  Serial.print(lowPass(0), DEC);
-//  Serial.print("\t");
-//  Serial.print(lowPass(1), DEC);
-//  Serial.print("\t");
-//  Serial.print(lowPass(2), DEC);
-//  Serial.print("\t");
-//  Serial.print(lowPass(3), DEC);
-//  Serial.print("\t");
-//  Serial.print(lowPass(4), DEC);
-//  Serial.print("\t");
-//  Serial.print(lowPass(5), DEC);
-//  Serial.print("\t");
-//  Serial.println(lowPass(6), DEC);
-//  delay(10);
 
+  if (playing) {
+    matrix.fillScreen(0);
+    
+    color = matrix.ColorHSV(hue, 255, 127, true);
+    colorInverse = matrix.ColorHSV((hue + (HUE_ROLL / 2)) % HUE_ROLL, 255, 127, true);
+
+    updateEqualizer();
+    showTrack();
+
+    matrix.swapBuffers(false);
+    hue = (hue + 1) % HUE_ROLL;
+  }
+  
+  // check for state changes
   boolean stoppedPlaying = false;
   boolean disconnected = false;
   if (Serial1.available()) {
@@ -102,14 +134,11 @@ void loop() {
         }
         connected = false;
         if(DEBUG) Serial.println("disconnected");
-        reenableDiscoverableIfNeccessary();
       } else if (line.startsWith("AVRCP_PAUSE") || line.startsWith("A2DP_STREAM_SUSPEND")) {
         if (playing) {
           stoppedPlaying = true;
         }
         playing = false;
-        title = "";
-        artist = "";
         if(DEBUG) Serial.println("stopped");
       } else if (line.startsWith("AVRCP_MEDIA TITLE")) {
         title = line.substring(19);
@@ -117,36 +146,30 @@ void loop() {
       } else if (line.startsWith("AVRCP_MEDIA ARTIST")) {
         artist = line.substring(20);
         artist.trim();
-        hasShownTitle = false;
+        setTrack(artist + " - " + title);
       }
-      delay(10);
     }
   }
-  printSongNameIfNeccessary();
-  if (playing) {
-    updateEqualizer();
-  } else {
-    if (stoppedPlaying){
-      if(DEBUG) Serial.println("stop playing");
-      clearEqualizer();
-    }
-    if (disconnected) {
-      delay(100);
-      reenableDiscoverableIfNeccessary();
-    }
+
+  if (stoppedPlaying) {
+    if(DEBUG) Serial.println("stop playing");
+    matrix.fillScreen(0);
+    matrix.swapBuffers(false);
+  }
+  if (disconnected) {
     delay(100);
+    reenableDiscoverable();
   }
+  delay(10);
 }
 
-uint32_t lowPass(uint8_t bandIndex) {
+uint8_t lowPass(uint8_t bandIndex) {
   uint32_t sum = 0;
   for (uint8_t i = 0; i < LP_STEPS; i++) {
     sum += measurements[(i * BANDS) + bandIndex];
   }
-  uint32_t result = sum * BUCKETS / LP_STEPS / 1024;
+  uint32_t result = sum * HEIGHT / LP_STEPS / 1024;
   return (uint8_t) result;
-//  return (uint8_t)(sum / LP_STEPS / 1024 * BUCKETS);
-//  return sum / LP_STEPS;
 }
 
 void setupTimer() {
@@ -179,7 +202,7 @@ void setupBluetooth() {
   if(DEBUG) Serial.println("ready");
 }
 
-void reenableDiscoverableIfNeccessary() {
+void reenableDiscoverable() {
   Serial1.print("STATUS\r");
   String line = Serial1.readStringUntil('\r');
   String nextLine;
@@ -196,22 +219,24 @@ void reenableDiscoverableIfNeccessary() {
 
 void updateEqualizer() {
   for (uint8_t i = 0; i < BANDS; i++) {
-    analogWrite(i + 2, lowPass(i));
+    uint8_t m = lowPass(i);
+    matrix.fillRect(bandOffsets[i], HEIGHT - m, bandWidths[i], m, color);
   }
 }
 
-void clearEqualizer() {
-  for (uint8_t i = 0; i < BANDS; i++) {
-    analogWrite(i + 2, 0);
-  }
+void setTrack(String trackName) {
+  track = trackName;
+  textX = WIDTH;
+  textMin = track.length() * -12;
+  trackShown = false;
 }
 
-void printSongNameIfNeccessary() {
-    if (playing && !hasShownTitle && title.length() > 0 && artist.length() > 0) {
-    if(DEBUG) Serial.print(artist);
-    if(DEBUG) Serial.print(" - ");
-    if(DEBUG) Serial.println(title);
-    hasShownTitle = true;
+void showTrack() {
+  if (!trackShown) {
+    matrix.setTextColor(colorInverse);
+    matrix.setCursor(textX, 8);
+    matrix.print(track);
+    if((--textX) < textMin) trackShown = true;
   }
 }
 
